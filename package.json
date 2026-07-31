@@ -1,0 +1,42 @@
+{
+  "name": "y-multiprovider",
+  "version": "0.1.0",
+  "description": "Coordinate multiple redundant Yjs providers behind one interface",
+  "keywords": [
+    "awareness",
+    "provider",
+    "webrtc",
+    "yjs"
+  ],
+  "license": "ISC",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.json",
+    "prepare": "npm run build",
+    "format": "vp fmt --write",
+    "lint": "vp lint",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vp test run",
+    "check": "npm run lint && npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "y-protocols": "^1.0.7",
+    "yjs": "^13.6.31"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "vite-plus": "^0.2.5"
+  }
+}
