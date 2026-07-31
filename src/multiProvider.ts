@@ -34,7 +34,12 @@ export interface MultiProviderOptions {
 }
 
 type Listener = (...args: unknown[]) => void;
-type AwarenessListener = () => void;
+export interface AwarenessChanges {
+  added: number[];
+  updated: number[];
+  removed: number[];
+}
+type AwarenessListener = (changes: AwarenessChanges, origin: MultiAwareness) => void;
 
 interface Child {
   name: string;
@@ -239,9 +244,14 @@ export class MultiAwareness {
   }
 
   setLocalState(state: Record<string, unknown> | null): void {
+    const hadLocalState = this.localState !== null;
     this.localState = state;
     this.publishLocalState(state);
-    this.emitChange();
+    this.emitChange({
+      added: !hadLocalState && state ? [0] : [],
+      updated: hadLocalState && state ? [0] : [],
+      removed: hadLocalState && !state ? [0] : [],
+    });
   }
 
   setLocalStateField(field: string, value: unknown): void {
@@ -257,8 +267,15 @@ export class MultiAwareness {
   }
 
   replaceRemoteStates(states: Map<number, Record<string, unknown>>): void {
+    const previousIds = new Set(this.remoteStates.keys());
+    const nextIds = new Set(states.keys());
+    const added = [...nextIds].filter((id) => !previousIds.has(id));
+    const updated = [...nextIds].filter((id) => previousIds.has(id));
+    const removed = [...previousIds].filter((id) => !nextIds.has(id));
     this.remoteStates = states;
-    this.emitChange();
+    if (added.length || updated.length || removed.length) {
+      this.emitChange({ added, updated, removed });
+    }
   }
 
   destroy(): void {
@@ -266,8 +283,8 @@ export class MultiAwareness {
     this.remoteStates.clear();
   }
 
-  private emitChange(): void {
-    for (const listener of this.listeners) listener();
+  private emitChange(changes: AwarenessChanges): void {
+    for (const listener of this.listeners) listener(changes, this);
   }
 }
 
