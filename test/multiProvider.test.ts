@@ -175,6 +175,9 @@ describe("MultiProvider", () => {
 
     provider.awareness.setLocalState({ peerId: "player-a" });
 
+    expect(provider.awareness.clientID).toBe(doc.clientID);
+    expect(provider.awareness.getStates().get(doc.clientID)).toEqual({ peerId: "player-a" });
+
     expect(instances[0]!.awareness.getLocalState()).toEqual({
       peerId: "player-a",
       transport: "first",

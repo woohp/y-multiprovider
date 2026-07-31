@@ -75,7 +75,7 @@ export class MultiProvider {
     if (names.size !== options.providers.length) {
       throw new Error("MultiProvider provider names must be unique");
     }
-    this.awareness = new MultiAwareness((state) => this.publishLocalAwareness(state));
+    this.awareness = new MultiAwareness(doc.clientID, (state) => this.publishLocalAwareness(state));
     this.children = options.providers.map((definition) => {
       const awareness = new Awareness(doc);
       const provider = definition.create({ doc, awareness });
@@ -198,6 +198,10 @@ export class MultiProvider {
     const states = new Map<number, Record<string, unknown>>();
     const routes = new Map<string, Map<string, string>>();
     let stateId = 1;
+    const nextStateId = (): number => {
+      while (stateId === this.doc.clientID || states.has(stateId)) stateId++;
+      return stateId++;
+    };
 
     for (const child of this.children) {
       for (const [clientId, state] of child.awareness.getStates()) {
@@ -209,7 +213,7 @@ export class MultiProvider {
         peerRoutes.set(child.name, transportPeerId);
         routes.set(peerId, peerRoutes);
         if (![...states.values()].some((candidate) => candidate["peerId"] === peerId)) {
-          states.set(stateId++, { ...state, peerId });
+          states.set(nextStateId(), { ...state, peerId });
         }
       }
     }
@@ -230,12 +234,13 @@ export class MultiAwareness {
   private readonly listeners = new Set<AwarenessListener>();
 
   constructor(
+    readonly clientID: number,
     private readonly publishLocalState: (state: Record<string, unknown> | null) => void,
   ) {}
 
   getStates(): Map<number, Record<string, unknown>> {
     const states = new Map(this.remoteStates);
-    if (this.localState) states.set(0, this.localState);
+    if (this.localState) states.set(this.clientID, this.localState);
     return states;
   }
 
@@ -248,9 +253,9 @@ export class MultiAwareness {
     this.localState = state;
     this.publishLocalState(state);
     this.emitChange({
-      added: !hadLocalState && state ? [0] : [],
-      updated: hadLocalState && state ? [0] : [],
-      removed: hadLocalState && !state ? [0] : [],
+      added: !hadLocalState && state ? [this.clientID] : [],
+      updated: hadLocalState && state ? [this.clientID] : [],
+      removed: hadLocalState && !state ? [this.clientID] : [],
     });
   }
 
