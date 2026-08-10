@@ -387,6 +387,7 @@ describe("MultiProvider", () => {
       { added: [], updated: [], removed: [firstStateId] },
       "test",
     );
+    expect(() => encodeAwarenessUpdate(provider.awareness, [firstStateId])).not.toThrow();
 
     provider.destroy();
     doc.destroy();

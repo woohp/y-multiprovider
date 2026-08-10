@@ -302,7 +302,13 @@ export class MultiProvider {
     const routes = new Map<string, Map<string, string>>();
     const selected = new Map<
       string,
-      { state: Record<string, unknown>; clock: number; lastUpdated: number; provider: string }
+      {
+        state: Record<string, unknown>;
+        clientId: number;
+        clock: number;
+        lastUpdated: number;
+        provider: string;
+      }
     >();
 
     for (const child of this.children) {
@@ -319,20 +325,26 @@ export class MultiProvider {
         const meta = child.awareness.meta.get(clientId);
         const candidate = {
           state: { ...state, peerId },
+          clientId,
           clock: meta?.clock ?? 0,
           lastUpdated: meta?.lastUpdated ?? 0,
           provider: child.name,
         };
         const current = selected.get(peerId);
-        if (
-          current === undefined ||
-          candidate.clock > current.clock ||
-          (candidate.clock === current.clock &&
-            (candidate.lastUpdated > current.lastUpdated ||
-              (candidate.lastUpdated === current.lastUpdated &&
-                candidate.provider === preferredProvider &&
-                current.provider !== preferredProvider)))
-        ) {
+        const candidateIsNewer =
+          current !== undefined && candidate.clientId === current.clientId
+            ? candidate.clock > current.clock ||
+              (candidate.clock === current.clock &&
+                (candidate.lastUpdated > current.lastUpdated ||
+                  (candidate.lastUpdated === current.lastUpdated &&
+                    candidate.provider === preferredProvider &&
+                    current.provider !== preferredProvider)))
+            : current !== undefined &&
+              (candidate.lastUpdated > current.lastUpdated ||
+                (candidate.lastUpdated === current.lastUpdated &&
+                  candidate.provider === preferredProvider &&
+                  current.provider !== preferredProvider));
+        if (current === undefined || candidateIsNewer) {
           selected.set(peerId, candidate);
         }
       }
@@ -395,8 +407,6 @@ export class MultiProvider {
 }
 
 export class MultiAwareness extends Awareness {
-  private localState: Record<string, unknown> | null = null;
-  private remoteStates = new Map<number, Record<string, unknown>>();
   private publishLocalState: ((state: Record<string, unknown> | null) => void) | undefined;
   private destroyed = false;
 
@@ -409,7 +419,7 @@ export class MultiAwareness extends Awareness {
   }
 
   getLocalState(): Record<string, unknown> | null {
-    return this.localState;
+    return (this.states.get(this.clientID) as Record<string, unknown> | undefined) ?? null;
   }
 
   setLocalState(state: Record<string, unknown> | null): void {
@@ -419,8 +429,7 @@ export class MultiAwareness extends Awareness {
     }
     if (this.destroyed) return;
 
-    const previousState = this.localState;
-    this.localState = state;
+    const previousState = this.getLocalState();
     if (state === null) this.states.delete(this.clientID);
     else this.states.set(this.clientID, state);
     this.updateMeta(this.clientID);
@@ -447,16 +456,21 @@ export class MultiAwareness extends Awareness {
     updatedPeerIds: ReadonlySet<string> = new Set(),
     origin: unknown = "remote",
   ): void {
+    const previousLocalState = this.getLocalState();
+    const previousRemoteStates = new Map(this.states);
+    previousRemoteStates.delete(this.clientID);
     const added: number[] = [];
     const updated: number[] = [];
     const updateIds: number[] = [];
     const removed: number[] = [];
 
     for (const [clientId, state] of states) {
-      const previousState = this.remoteStates.get(clientId);
+      const previousState = previousRemoteStates.get(clientId);
       if (previousState === undefined) {
         added.push(clientId);
-        this.meta.set(clientId, { clock: 0, lastUpdated: currentAwarenessTime() });
+        if (!this.meta.has(clientId)) {
+          this.meta.set(clientId, { clock: 0, lastUpdated: currentAwarenessTime() });
+        }
       } else {
         const changed = !equalityDeep(previousState, state);
         const peerId = state["peerId"];
@@ -467,17 +481,13 @@ export class MultiAwareness extends Awareness {
         }
       }
     }
-    for (const clientId of this.remoteStates.keys()) {
-      if (!states.has(clientId)) {
-        removed.push(clientId);
-        this.meta.delete(clientId);
-      }
+    for (const clientId of previousRemoteStates.keys()) {
+      if (!states.has(clientId)) removed.push(clientId);
     }
 
-    this.remoteStates = new Map(states);
     this.states.clear();
-    for (const [clientId, state] of this.remoteStates) this.states.set(clientId, state);
-    if (this.localState !== null) this.states.set(this.clientID, this.localState);
+    for (const [clientId, state] of states) this.states.set(clientId, state);
+    if (previousLocalState !== null) this.states.set(this.clientID, previousLocalState);
 
     this.emitAwarenessChanges(
       { added, updated, removed },
@@ -489,8 +499,6 @@ export class MultiAwareness extends Awareness {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
-    this.localState = null;
-    this.remoteStates.clear();
     this.states.clear();
     this.meta.clear();
     super.destroy();
@@ -517,7 +525,7 @@ export class MultiAwareness extends Awareness {
 }
 
 function currentAwarenessTime(): number {
-  return Math.floor(Date.now() / 1000);
+  return Date.now();
 }
 
 function cloneRoutes(routes: Map<string, Map<string, string>>): Map<string, Map<string, string>> {
