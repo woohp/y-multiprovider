@@ -330,4 +330,82 @@ describe("MultiProvider", () => {
     expect(instances.map(({ destroyCalls }) => destroyCalls)).toEqual([1, 1]);
     doc.destroy();
   });
+
+  it("keeps logical peer routes and awareness IDs stable across transport changes", () => {
+    const { doc, provider, instances } = createTwoProviderSetup();
+    const awarenessChanges = vi.fn();
+    const peerChanges = vi.fn();
+    provider.awareness.on("change", awarenessChanges);
+    provider.on("peer-change", peerChanges);
+
+    const removeFirst = addRemoteAwareness(
+      instances[0]!.awareness,
+      "player-b",
+      "first-remote",
+      "first",
+    );
+    const firstState = [...provider.awareness.getStates()].find(
+      ([, state]) => state["peerId"] === "player-b",
+    );
+    expect(firstState).toBeDefined();
+    const firstStateId = firstState![0];
+    expect(peerChanges).toHaveBeenLastCalledWith({
+      peerId: "player-b",
+      connected: true,
+      transports: ["first"],
+    });
+
+    const removeSecond = addRemoteAwareness(
+      instances[1]!.awareness,
+      "player-b",
+      "second-remote",
+      "second",
+    );
+    const secondState = [...provider.awareness.getStates()].find(
+      ([, state]) => state["peerId"] === "player-b",
+    );
+    expect(secondState?.[0]).toBe(firstStateId);
+
+    removeFirst();
+    expect(
+      [...provider.awareness.getStates()].find(([clientId]) => clientId === firstStateId)?.[1],
+    ).toMatchObject({
+      peerId: "player-b",
+      transport: "second",
+    });
+
+    removeSecond();
+    expect(peerChanges).toHaveBeenLastCalledWith({
+      peerId: "player-b",
+      connected: false,
+      transports: [],
+    });
+    expect(awarenessChanges).toHaveBeenLastCalledWith(
+      { added: [], updated: [], removed: [firstStateId] },
+      provider.awareness,
+    );
+
+    provider.destroy();
+    doc.destroy();
+  });
+
+  it("forwards child sync and transport peer events", () => {
+    const { doc, provider, instances } = createTwoProviderSetup();
+    const handleSynced = vi.fn();
+    const handlePeers = vi.fn();
+    provider.on("synced", handleSynced);
+    provider.on("peers", handlePeers);
+
+    instances[0]!.emit("synced", true);
+    instances[1]!.emit("peers", ["remote-peer"]);
+
+    expect(handleSynced).toHaveBeenCalledWith({ provider: "first", synced: true });
+    expect(handlePeers).toHaveBeenCalledWith({
+      provider: "second",
+      peerIds: ["remote-peer"],
+    });
+
+    provider.destroy();
+    doc.destroy();
+  });
 });

@@ -1,13 +1,18 @@
+import { equalityDeep } from "lib0/function";
 import type * as Y from "yjs";
 import { Awareness } from "y-protocols/awareness";
 
-interface ProviderEvents {
-  status: unknown;
-  debug: unknown;
-  "connection-error": unknown;
-  "peer-error": unknown;
-  "direct-message": [string, Uint8Array];
+export interface ChildProviderEvents {
+  status: (event: unknown) => void;
+  synced: (synced: boolean) => void;
+  peers: (peerIds: readonly string[]) => void;
+  debug: (event: unknown) => void;
+  "connection-error": (event: unknown) => void;
+  "peer-error": (event: unknown) => void;
+  "direct-message": (peerId: string, payload: Uint8Array) => void;
 }
+
+type ChildProviderEventName = keyof ChildProviderEvents & string;
 
 export interface ChildProvider {
   readonly peerId: string;
@@ -33,13 +38,35 @@ export interface MultiProviderOptions {
   providers: ProviderDefinition[];
 }
 
+export interface MultiProviderEvents {
+  status: (event: { provider: string; event: unknown }) => void;
+  synced: (event: { provider: string; synced: boolean }) => void;
+  peers: (event: { provider: string; peerIds: readonly string[] }) => void;
+  debug: (event: { provider: string; event: unknown }) => void;
+  "connection-error": (event: { provider: string; event: unknown }) => void;
+  "peer-error": (event: { provider: string; event: unknown }) => void;
+  "direct-message": (peerId: string, payload: Uint8Array) => void;
+  "peer-change": (event: LogicalPeerChange) => void;
+}
+
+export interface LogicalPeerChange {
+  peerId: string;
+  connected: boolean;
+  transports: readonly string[];
+}
+
+type MultiProviderEventName = keyof MultiProviderEvents & string;
 type Listener = (...args: unknown[]) => void;
+
 export interface AwarenessChanges {
   added: number[];
   updated: number[];
   removed: number[];
 }
+
 type AwarenessListener = (changes: AwarenessChanges, origin: MultiAwareness) => void;
+
+type AwarenessEventName = "change" | "update";
 
 interface Child {
   name: string;
@@ -59,6 +86,9 @@ export class MultiProvider {
   private readonly children: Child[];
   private readonly listeners = new Map<string, Set<Listener>>();
   private readonly routes = new Map<string, Map<string, string>>();
+  private readonly stateIds = new Map<string, number>();
+  private readonly allocatedStateIds = new Set<number>();
+  private nextStateId = 1;
   private readonly seenMessageIds = new Set<string>();
   private readonly seenMessageQueue: string[] = [];
   private destroyed = false;
@@ -94,9 +124,9 @@ export class MultiProvider {
     );
   }
 
-  on(event: string, listener: Listener): void {
-    const listeners = this.listeners.get(event) ?? new Set();
-    listeners.add(listener);
+  on<Name extends MultiProviderEventName>(event: Name, listener: MultiProviderEvents[Name]): void {
+    const listeners = this.listeners.get(event) ?? new Set<Listener>();
+    listeners.add(listener as unknown as Listener);
     this.listeners.set(event, listeners);
   }
 
@@ -133,24 +163,40 @@ export class MultiProvider {
     this.awareness.destroy();
     this.listeners.clear();
     this.routes.clear();
+    this.stateIds.clear();
+    this.allocatedStateIds.clear();
   }
 
   private attachProvider(child: Child): void {
-    child.provider.on("status", ((event: ProviderEvents["status"]) => {
+    this.onChildProviderEvent(child, "status", (event) => {
       this.emit("status", { provider: child.name, event });
-    }) as (...args: never[]) => void);
-    child.provider.on("debug", ((event: ProviderEvents["debug"]) => {
+    });
+    this.onChildProviderEvent(child, "synced", (synced) => {
+      this.emit("synced", { provider: child.name, synced });
+    });
+    this.onChildProviderEvent(child, "peers", (peerIds) => {
+      this.emit("peers", { provider: child.name, peerIds });
+    });
+    this.onChildProviderEvent(child, "debug", (event) => {
       this.emit("debug", { provider: child.name, event });
-    }) as (...args: never[]) => void);
-    child.provider.on("connection-error", ((event: ProviderEvents["connection-error"]) => {
+    });
+    this.onChildProviderEvent(child, "connection-error", (event) => {
       this.emit("connection-error", { provider: child.name, event });
-    }) as (...args: never[]) => void);
-    child.provider.on("peer-error", ((event: ProviderEvents["peer-error"]) => {
+    });
+    this.onChildProviderEvent(child, "peer-error", (event) => {
       this.emit("peer-error", { provider: child.name, event });
-    }) as (...args: never[]) => void);
-    child.provider.on("direct-message", ((transportPeerId: string, frame: Uint8Array) => {
+    });
+    this.onChildProviderEvent(child, "direct-message", (transportPeerId, frame) => {
       this.handleDirectMessage(child.name, transportPeerId, frame);
-    }) as (...args: never[]) => void);
+    });
+  }
+
+  private onChildProviderEvent<Name extends ChildProviderEventName>(
+    child: Child,
+    event: Name,
+    listener: ChildProviderEvents[Name],
+  ): void {
+    child.provider.on(event, listener as (...args: never[]) => void);
   }
 
   private handleDirectMessage(
@@ -195,13 +241,10 @@ export class MultiProvider {
   }
 
   private handleAwarenessChange(): void {
+    const previousRoutes = cloneRoutes(this.routes);
     const states = new Map<number, Record<string, unknown>>();
     const routes = new Map<string, Map<string, string>>();
-    let stateId = 1;
-    const nextStateId = (): number => {
-      while (stateId === this.doc.clientID || states.has(stateId)) stateId++;
-      return stateId++;
-    };
+    const seenPeerIds = new Set<string>();
 
     for (const child of this.children) {
       for (const [clientId, state] of child.awareness.getStates()) {
@@ -209,11 +252,14 @@ export class MultiProvider {
         const peerId = state["peerId"];
         const transportPeerId = state["transportPeerId"];
         if (typeof peerId !== "string" || typeof transportPeerId !== "string") continue;
+
         const peerRoutes = routes.get(peerId) ?? new Map<string, string>();
         peerRoutes.set(child.name, transportPeerId);
         routes.set(peerId, peerRoutes);
-        if (![...states.values()].some((candidate) => candidate["peerId"] === peerId)) {
-          states.set(nextStateId(), { ...state, peerId });
+
+        if (!seenPeerIds.has(peerId)) {
+          seenPeerIds.add(peerId);
+          states.set(this.getStateId(peerId), { ...state, peerId });
         }
       }
     }
@@ -221,9 +267,42 @@ export class MultiProvider {
     this.routes.clear();
     for (const [peerId, peerRoutes] of routes) this.routes.set(peerId, peerRoutes);
     this.awareness.replaceRemoteStates(states);
+    this.emitPeerChanges(previousRoutes, routes);
   }
 
-  private emit(event: string, ...args: unknown[]): void {
+  private getStateId(peerId: string): number {
+    const existing = this.stateIds.get(peerId);
+    if (existing !== undefined) return existing;
+
+    let stateId = this.nextStateId;
+    while (stateId === this.doc.clientID || this.allocatedStateIds.has(stateId)) stateId++;
+    this.nextStateId = stateId + 1;
+    this.stateIds.set(peerId, stateId);
+    this.allocatedStateIds.add(stateId);
+    return stateId;
+  }
+
+  private emitPeerChanges(
+    previousRoutes: Map<string, Map<string, string>>,
+    nextRoutes: Map<string, Map<string, string>>,
+  ): void {
+    const peerIds = new Set([...previousRoutes.keys(), ...nextRoutes.keys()]);
+    for (const peerId of peerIds) {
+      const previous = previousRoutes.get(peerId);
+      const next = nextRoutes.get(peerId);
+      if ((previous !== undefined) === (next !== undefined)) continue;
+      this.emit("peer-change", {
+        peerId,
+        connected: next !== undefined,
+        transports: next ? [...next.keys()] : [],
+      });
+    }
+  }
+
+  private emit<Name extends MultiProviderEventName>(
+    event: Name,
+    ...args: Parameters<MultiProviderEvents[Name]>
+  ): void {
     for (const listener of this.listeners.get(event) ?? []) listener(...args);
   }
 }
@@ -231,7 +310,10 @@ export class MultiProvider {
 export class MultiAwareness {
   private localState: Record<string, unknown> | null = null;
   private remoteStates = new Map<number, Record<string, unknown>>();
-  private readonly listeners = new Set<AwarenessListener>();
+  private readonly listeners = new Map<AwarenessEventName, Set<AwarenessListener>>([
+    ["change", new Set()],
+    ["update", new Set()],
+  ]);
 
   constructor(
     readonly clientID: number,
@@ -249,48 +331,67 @@ export class MultiAwareness {
   }
 
   setLocalState(state: Record<string, unknown> | null): void {
-    const hadLocalState = this.localState !== null;
+    const previousState = this.localState;
     this.localState = state;
     this.publishLocalState(state);
-    this.emitChange({
-      added: !hadLocalState && state ? [this.clientID] : [],
-      updated: hadLocalState && state ? [this.clientID] : [],
-      removed: hadLocalState && !state ? [this.clientID] : [],
-    });
+
+    const changes: AwarenessChanges = {
+      added: previousState === null && state !== null ? [this.clientID] : [],
+      updated:
+        previousState !== null && state !== null && !equalityDeep(previousState, state)
+          ? [this.clientID]
+          : [],
+      removed: previousState !== null && state === null ? [this.clientID] : [],
+    };
+    this.emitChanges(changes);
   }
 
   setLocalStateField(field: string, value: unknown): void {
+    if (this.localState === null) return;
     this.setLocalState({ ...this.localState, [field]: value });
   }
 
-  on(event: "change", listener: AwarenessListener): void {
-    if (event === "change") this.listeners.add(listener);
+  on(event: AwarenessEventName, listener: AwarenessListener): void {
+    this.listeners.get(event)?.add(listener);
   }
 
-  off(event: "change", listener: AwarenessListener): void {
-    if (event === "change") this.listeners.delete(listener);
+  off(event: AwarenessEventName, listener: AwarenessListener): void {
+    this.listeners.get(event)?.delete(listener);
   }
 
   replaceRemoteStates(states: Map<number, Record<string, unknown>>): void {
-    const previousIds = new Set(this.remoteStates.keys());
-    const nextIds = new Set(states.keys());
-    const added = [...nextIds].filter((id) => !previousIds.has(id));
-    const updated = [...nextIds].filter((id) => previousIds.has(id));
-    const removed = [...previousIds].filter((id) => !nextIds.has(id));
-    this.remoteStates = states;
-    if (added.length || updated.length || removed.length) {
-      this.emitChange({ added, updated, removed });
+    const added: number[] = [];
+    const updated: number[] = [];
+    const removed: number[] = [];
+
+    for (const [clientId, state] of states) {
+      const previousState = this.remoteStates.get(clientId);
+      if (previousState === undefined) added.push(clientId);
+      else if (!equalityDeep(previousState, state)) updated.push(clientId);
     }
+    for (const clientId of this.remoteStates.keys()) {
+      if (!states.has(clientId)) removed.push(clientId);
+    }
+
+    this.remoteStates = new Map(states);
+    this.emitChanges({ added, updated, removed });
   }
 
   destroy(): void {
-    this.listeners.clear();
+    this.listeners.forEach((listeners) => listeners.clear());
     this.remoteStates.clear();
   }
 
-  private emitChange(changes: AwarenessChanges): void {
-    for (const listener of this.listeners) listener(changes, this);
+  private emitChanges(changes: AwarenessChanges): void {
+    if (changes.added.length || changes.updated.length || changes.removed.length) {
+      for (const listener of this.listeners.get("change") ?? []) listener(changes, this);
+    }
+    for (const listener of this.listeners.get("update") ?? []) listener(changes, this);
   }
+}
+
+function cloneRoutes(routes: Map<string, Map<string, string>>): Map<string, Map<string, string>> {
+  return new Map([...routes].map(([peerId, peerRoutes]) => [peerId, new Map(peerRoutes)] as const));
 }
 
 function createFrame(payload: Uint8Array): Uint8Array {

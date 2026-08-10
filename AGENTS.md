@@ -5,4 +5,7 @@
 - Logical peer IDs are advertised as `peerId`; child transport IDs are added as `transportPeerId` and `transport`.
 - Directed messages are redundantly sent through all available routes and deduplicated by the wrapper frame ID.
 - Yjs document updates need no wrapper forwarding; every child observes the same document and Yjs handles duplicate updates.
+- `MultiAwareness` uses `doc.clientID` for local state, stable synthetic IDs for logical remote peers, and reports standard added/updated/removed awareness changes.
+- `peer-change` reports only logical first-route connect and last-route disconnect; child `peers` events remain transport-specific.
+
 - Run `npm run format` and `npm run check` after changes.
