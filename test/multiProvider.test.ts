@@ -176,6 +176,9 @@ describe("MultiProvider", () => {
     provider.awareness.setLocalState({ peerId: "player-a" });
 
     expect(provider.awareness.clientID).toBe(doc.clientID);
+    const standardAwareness: Awareness = provider.awareness;
+    expect(standardAwareness).toBe(provider.awareness);
+    expect(provider.awareness).toBeInstanceOf(Awareness);
     expect(provider.awareness.getStates().get(doc.clientID)).toEqual({ peerId: "player-a" });
 
     expect(instances[0]!.awareness.getLocalState()).toEqual({
@@ -382,7 +385,7 @@ describe("MultiProvider", () => {
     });
     expect(awarenessChanges).toHaveBeenLastCalledWith(
       { added: [], updated: [], removed: [firstStateId] },
-      provider.awareness,
+      "test",
     );
 
     provider.destroy();
@@ -404,6 +407,114 @@ describe("MultiProvider", () => {
       provider: "second",
       peerIds: ["remote-peer"],
     });
+
+    provider.destroy();
+    doc.destroy();
+  });
+
+  it("selects the latest logical state across redundant transports", () => {
+    const { doc, provider, instances } = createTwoProviderSetup();
+    const remoteDoc = new Y.Doc();
+    const remoteAwareness = new Awareness(remoteDoc);
+    const remoteClientId = remoteDoc.clientID;
+    const updates = vi.fn();
+    provider.awareness.on("update", updates);
+
+    const publish = (target: Awareness, state: Record<string, unknown>): void => {
+      applyAwarenessUpdate(
+        target,
+        encodeAwarenessUpdate(
+          remoteAwareness,
+          [remoteClientId],
+          new Map([[remoteClientId, state]]),
+        ),
+        "test",
+      );
+    };
+
+    remoteAwareness.setLocalState({ peerId: "player-c" });
+    publish(instances[0]!.awareness, {
+      peerId: "player-c",
+      transportPeerId: "first-remote",
+      transport: "first",
+      cursor: "old",
+    });
+    publish(instances[1]!.awareness, {
+      peerId: "player-c",
+      transportPeerId: "second-remote",
+      transport: "second",
+      cursor: "old",
+    });
+
+    remoteAwareness.setLocalState({ peerId: "player-c", cursor: "new" });
+    publish(instances[1]!.awareness, {
+      peerId: "player-c",
+      transportPeerId: "second-remote",
+      transport: "second",
+      cursor: "new",
+    });
+
+    const state = [...provider.awareness.getStates()].find(
+      ([, candidate]) => candidate["peerId"] === "player-c",
+    );
+    expect(state?.[1]).toMatchObject({ cursor: "new", transport: "second" });
+    expect(updates).toHaveBeenLastCalledWith(
+      { added: [], updated: [state![0]], removed: [] },
+      "test",
+    );
+
+    remoteAwareness.setLocalState({ peerId: "player-c", cursor: "new" });
+    publish(instances[1]!.awareness, {
+      peerId: "player-c",
+      transportPeerId: "second-remote",
+      transport: "second",
+      cursor: "new",
+    });
+    expect(updates).toHaveBeenLastCalledWith(
+      { added: [], updated: [state![0]], removed: [] },
+      "test",
+    );
+
+    remoteAwareness.setLocalState(null);
+    const removal = encodeAwarenessUpdate(remoteAwareness, [remoteClientId]);
+    applyAwarenessUpdate(instances[0]!.awareness, removal, "test");
+    applyAwarenessUpdate(instances[1]!.awareness, removal, "test");
+    remoteAwareness.destroy();
+    remoteDoc.destroy();
+    provider.destroy();
+    doc.destroy();
+  });
+
+  it("filters change events while retaining standard update events", () => {
+    const { doc, provider } = createTwoProviderSetup();
+    const changes = vi.fn();
+    const updates = vi.fn();
+    provider.awareness.on("change", changes);
+    provider.awareness.on("update", updates);
+
+    provider.awareness.setLocalState({ peerId: "local" });
+    expect(changes).toHaveBeenLastCalledWith(
+      { added: [doc.clientID], updated: [], removed: [] },
+      "local",
+    );
+    expect(updates).toHaveBeenLastCalledWith(
+      { added: [doc.clientID], updated: [], removed: [] },
+      "local",
+    );
+
+    const changeCount = changes.mock.calls.length;
+    provider.awareness.setLocalState({ peerId: "local" });
+    expect(changes).toHaveBeenCalledTimes(changeCount);
+    expect(updates).toHaveBeenLastCalledWith(
+      { added: [], updated: [doc.clientID], removed: [] },
+      "local",
+    );
+
+    provider.awareness.setLocalStateField("cursor", { line: 1 });
+    expect(changes).toHaveBeenLastCalledWith(
+      { added: [], updated: [doc.clientID], removed: [] },
+      "local",
+    );
 
     provider.destroy();
     doc.destroy();

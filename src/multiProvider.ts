@@ -64,15 +64,14 @@ export interface AwarenessChanges {
   removed: number[];
 }
 
-type AwarenessListener = (changes: AwarenessChanges, origin: MultiAwareness) => void;
-
-type AwarenessEventName = "change" | "update";
+type ChildAwarenessListener = (changes: AwarenessChanges, origin: unknown) => void;
 
 interface Child {
   name: string;
   provider: ChildProvider;
   awareness: Awareness;
-  handleAwarenessChange: AwarenessListener;
+  handleAwarenessUpdate: ChildAwarenessListener;
+  remotePeerIds: Map<number, string>;
 }
 
 const FRAME_MAGIC = new Uint8Array([0x79, 0x6d, 0x70, 0x31]);
@@ -105,7 +104,7 @@ export class MultiProvider {
     if (names.size !== options.providers.length) {
       throw new Error("MultiProvider provider names must be unique");
     }
-    this.awareness = new MultiAwareness(doc.clientID, (state) => this.publishLocalAwareness(state));
+    this.awareness = new MultiAwareness(doc, (state) => this.publishLocalAwareness(state));
     this.children = options.providers.map((definition) => {
       const awareness = new Awareness(doc);
       const provider = definition.create({ doc, awareness });
@@ -113,12 +112,16 @@ export class MultiProvider {
         name: definition.name,
         provider,
         awareness,
-        handleAwarenessChange: () => this.handleAwarenessChange(),
+        handleAwarenessUpdate: (changes, origin) =>
+          this.handleAwarenessUpdate(child, changes, origin),
+        remotePeerIds: new Map(),
       };
-      awareness.on("change", child.handleAwarenessChange);
+      this.syncChildPeerIds(child);
+      awareness.on("update", child.handleAwarenessUpdate);
       this.attachProvider(child);
       return child;
     });
+    this.rebuildAwareness(new Set());
     this.ready = Promise.any(this.children.map(({ provider }) => provider.ready)).then(
       () => undefined,
     );
@@ -156,7 +159,7 @@ export class MultiProvider {
     this.destroyed = true;
     this.awareness.setLocalState(null);
     for (const child of this.children) {
-      child.awareness.off("change", child.handleAwarenessChange);
+      child.awareness.off("update", child.handleAwarenessUpdate);
       child.provider.destroy();
       child.awareness.destroy();
     }
@@ -240,34 +243,118 @@ export class MultiProvider {
     }
   }
 
-  private handleAwarenessChange(): void {
+  private syncChildPeerIds(child: Child): void {
+    child.remotePeerIds.clear();
+    for (const [clientId, state] of child.awareness.getStates()) {
+      if (clientId === this.doc.clientID) continue;
+      const peerId = this.getLogicalPeerId(state);
+      if (peerId) child.remotePeerIds.set(clientId, peerId);
+    }
+  }
+
+  private handleAwarenessUpdate(child: Child, changes: AwarenessChanges, origin: unknown): void {
+    const affectedPeerIds = new Set<string>();
+    let hasRemoteChange = false;
+    const updatedClientIds = new Set([...changes.added, ...changes.updated]);
+
+    for (const clientId of updatedClientIds) {
+      if (clientId === this.doc.clientID) continue;
+      hasRemoteChange = true;
+      const previousPeerId = child.remotePeerIds.get(clientId);
+      if (previousPeerId) affectedPeerIds.add(previousPeerId);
+
+      const state = child.awareness.getStates().get(clientId);
+      const peerId = state ? this.getLogicalPeerId(state) : null;
+      if (peerId) {
+        child.remotePeerIds.set(clientId, peerId);
+        affectedPeerIds.add(peerId);
+      } else {
+        child.remotePeerIds.delete(clientId);
+      }
+    }
+
+    for (const clientId of changes.removed) {
+      if (clientId === this.doc.clientID) continue;
+      hasRemoteChange = true;
+      const peerId = child.remotePeerIds.get(clientId);
+      if (peerId) affectedPeerIds.add(peerId);
+      child.remotePeerIds.delete(clientId);
+    }
+
+    if (hasRemoteChange) {
+      this.rebuildAwareness(affectedPeerIds, child.name, origin);
+    }
+  }
+
+  private getLogicalPeerId(state: Record<string, unknown>): string | null {
+    const peerId = state["peerId"];
+    const transportPeerId = state["transportPeerId"];
+    return typeof peerId === "string" && typeof transportPeerId === "string" ? peerId : null;
+  }
+
+  private rebuildAwareness(
+    affectedPeerIds: ReadonlySet<string>,
+    preferredProvider: string | undefined = undefined,
+    origin: unknown = "remote",
+  ): void {
     const previousRoutes = cloneRoutes(this.routes);
     const states = new Map<number, Record<string, unknown>>();
     const routes = new Map<string, Map<string, string>>();
-    const seenPeerIds = new Set<string>();
+    const selected = new Map<
+      string,
+      { state: Record<string, unknown>; clock: number; lastUpdated: number; provider: string }
+    >();
 
     for (const child of this.children) {
-      for (const [clientId, state] of child.awareness.getStates()) {
+      for (const [clientId, rawState] of child.awareness.getStates()) {
         if (clientId === this.doc.clientID) continue;
-        const peerId = state["peerId"];
-        const transportPeerId = state["transportPeerId"];
-        if (typeof peerId !== "string" || typeof transportPeerId !== "string") continue;
+        const state = rawState as Record<string, unknown>;
+        const peerId = this.getLogicalPeerId(state);
+        if (!peerId) continue;
 
         const peerRoutes = routes.get(peerId) ?? new Map<string, string>();
-        peerRoutes.set(child.name, transportPeerId);
+        peerRoutes.set(child.name, state["transportPeerId"] as string);
         routes.set(peerId, peerRoutes);
 
-        if (!seenPeerIds.has(peerId)) {
-          seenPeerIds.add(peerId);
-          states.set(this.getStateId(peerId), { ...state, peerId });
+        const meta = child.awareness.meta.get(clientId);
+        const candidate = {
+          state: { ...state, peerId },
+          clock: meta?.clock ?? 0,
+          lastUpdated: meta?.lastUpdated ?? 0,
+          provider: child.name,
+        };
+        const current = selected.get(peerId);
+        if (
+          current === undefined ||
+          candidate.clock > current.clock ||
+          (candidate.clock === current.clock &&
+            (candidate.lastUpdated > current.lastUpdated ||
+              (candidate.lastUpdated === current.lastUpdated &&
+                candidate.provider === preferredProvider &&
+                current.provider !== preferredProvider)))
+        ) {
+          selected.set(peerId, candidate);
         }
       }
     }
 
     this.routes.clear();
     for (const [peerId, peerRoutes] of routes) this.routes.set(peerId, peerRoutes);
-    this.awareness.replaceRemoteStates(states);
+    this.retireStateIds(new Set(routes.keys()));
+    for (const [peerId, candidate] of selected) {
+      states.set(this.getStateId(peerId), candidate.state);
+    }
+    this.awareness.replaceRemoteStates(states, affectedPeerIds, origin);
     this.emitPeerChanges(previousRoutes, routes);
+  }
+
+  private retireStateIds(activePeerIds: ReadonlySet<string>): void {
+    for (const [peerId, stateId] of this.stateIds) {
+      if (!activePeerIds.has(peerId)) {
+        this.stateIds.delete(peerId);
+        this.allocatedStateIds.delete(stateId);
+      }
+    }
   }
 
   private getStateId(peerId: string): number {
@@ -307,23 +394,18 @@ export class MultiProvider {
   }
 }
 
-export class MultiAwareness {
+export class MultiAwareness extends Awareness {
   private localState: Record<string, unknown> | null = null;
   private remoteStates = new Map<number, Record<string, unknown>>();
-  private readonly listeners = new Map<AwarenessEventName, Set<AwarenessListener>>([
-    ["change", new Set()],
-    ["update", new Set()],
-  ]);
+  private publishLocalState: ((state: Record<string, unknown> | null) => void) | undefined;
+  private destroyed = false;
 
-  constructor(
-    readonly clientID: number,
-    private readonly publishLocalState: (state: Record<string, unknown> | null) => void,
-  ) {}
-
-  getStates(): Map<number, Record<string, unknown>> {
-    const states = new Map(this.remoteStates);
-    if (this.localState) states.set(this.clientID, this.localState);
-    return states;
+  constructor(doc: Y.Doc, publishLocalState: (state: Record<string, unknown> | null) => void) {
+    super(doc);
+    this.publishLocalState = publishLocalState;
+    super.setLocalState(null);
+    this.states.clear();
+    this.meta.clear();
   }
 
   getLocalState(): Record<string, unknown> | null {
@@ -331,8 +413,17 @@ export class MultiAwareness {
   }
 
   setLocalState(state: Record<string, unknown> | null): void {
+    if (this.publishLocalState === undefined) {
+      super.setLocalState(state);
+      return;
+    }
+    if (this.destroyed) return;
+
     const previousState = this.localState;
     this.localState = state;
+    if (state === null) this.states.delete(this.clientID);
+    else this.states.set(this.clientID, state);
+    this.updateMeta(this.clientID);
     this.publishLocalState(state);
 
     const changes: AwarenessChanges = {
@@ -343,51 +434,90 @@ export class MultiAwareness {
           : [],
       removed: previousState !== null && state === null ? [this.clientID] : [],
     };
-    this.emitChanges(changes);
+    const updates: AwarenessChanges = {
+      added: changes.added,
+      updated: previousState !== null && state !== null ? [this.clientID] : [],
+      removed: changes.removed,
+    };
+    this.emitAwarenessChanges(changes, updates, "local");
   }
 
-  setLocalStateField(field: string, value: unknown): void {
-    if (this.localState === null) return;
-    this.setLocalState({ ...this.localState, [field]: value });
-  }
-
-  on(event: AwarenessEventName, listener: AwarenessListener): void {
-    this.listeners.get(event)?.add(listener);
-  }
-
-  off(event: AwarenessEventName, listener: AwarenessListener): void {
-    this.listeners.get(event)?.delete(listener);
-  }
-
-  replaceRemoteStates(states: Map<number, Record<string, unknown>>): void {
+  replaceRemoteStates(
+    states: Map<number, Record<string, unknown>>,
+    updatedPeerIds: ReadonlySet<string> = new Set(),
+    origin: unknown = "remote",
+  ): void {
     const added: number[] = [];
     const updated: number[] = [];
+    const updateIds: number[] = [];
     const removed: number[] = [];
 
     for (const [clientId, state] of states) {
       const previousState = this.remoteStates.get(clientId);
-      if (previousState === undefined) added.push(clientId);
-      else if (!equalityDeep(previousState, state)) updated.push(clientId);
+      if (previousState === undefined) {
+        added.push(clientId);
+        this.meta.set(clientId, { clock: 0, lastUpdated: currentAwarenessTime() });
+      } else {
+        const changed = !equalityDeep(previousState, state);
+        const peerId = state["peerId"];
+        if (changed) updated.push(clientId);
+        if (changed || (typeof peerId === "string" && updatedPeerIds.has(peerId))) {
+          updateIds.push(clientId);
+          this.updateMeta(clientId);
+        }
+      }
     }
     for (const clientId of this.remoteStates.keys()) {
-      if (!states.has(clientId)) removed.push(clientId);
+      if (!states.has(clientId)) {
+        removed.push(clientId);
+        this.meta.delete(clientId);
+      }
     }
 
     this.remoteStates = new Map(states);
-    this.emitChanges({ added, updated, removed });
+    this.states.clear();
+    for (const [clientId, state] of this.remoteStates) this.states.set(clientId, state);
+    if (this.localState !== null) this.states.set(this.clientID, this.localState);
+
+    this.emitAwarenessChanges(
+      { added, updated, removed },
+      { added, updated: updateIds, removed },
+      origin,
+    );
   }
 
   destroy(): void {
-    this.listeners.forEach((listeners) => listeners.clear());
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.localState = null;
     this.remoteStates.clear();
+    this.states.clear();
+    this.meta.clear();
+    super.destroy();
   }
 
-  private emitChanges(changes: AwarenessChanges): void {
-    if (changes.added.length || changes.updated.length || changes.removed.length) {
-      for (const listener of this.listeners.get("change") ?? []) listener(changes, this);
-    }
-    for (const listener of this.listeners.get("update") ?? []) listener(changes, this);
+  private updateMeta(clientId: number): void {
+    const previous = this.meta.get(clientId);
+    this.meta.set(clientId, {
+      clock: previous === undefined ? 0 : previous.clock + 1,
+      lastUpdated: currentAwarenessTime(),
+    });
   }
+
+  private emitAwarenessChanges(
+    changes: AwarenessChanges,
+    updates: AwarenessChanges,
+    origin: unknown,
+  ): void {
+    if (changes.added.length || changes.updated.length || changes.removed.length) {
+      this.emit("change", [changes, origin]);
+    }
+    this.emit("update", [updates, origin]);
+  }
+}
+
+function currentAwarenessTime(): number {
+  return Math.floor(Date.now() / 1000);
 }
 
 function cloneRoutes(routes: Map<string, Map<string, string>>): Map<string, Map<string, string>> {
