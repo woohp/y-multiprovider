@@ -87,6 +87,7 @@ export class MultiProvider {
   private readonly routes = new Map<string, Map<string, string>>();
   private readonly stateIds = new Map<string, number>();
   private readonly allocatedStateIds = new Set<number>();
+  private logicalAwarenessClock = 0;
   private nextStateId = 1;
   private readonly seenMessageIds = new Set<string>();
   private readonly seenMessageQueue: string[] = [];
@@ -157,13 +158,12 @@ export class MultiProvider {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
-    this.awareness.setLocalState(null);
+    this.awareness.destroy();
     for (const child of this.children) {
       child.awareness.off("update", child.handleAwarenessUpdate);
       child.provider.destroy();
       child.awareness.destroy();
     }
-    this.awareness.destroy();
     this.listeners.clear();
     this.routes.clear();
     this.stateIds.clear();
@@ -230,6 +230,7 @@ export class MultiProvider {
   }
 
   private publishLocalAwareness(state: Record<string, unknown> | null): void {
+    const logicalClock = state ? ++this.logicalAwarenessClock : this.logicalAwarenessClock;
     for (const child of this.children ?? []) {
       child.awareness.setLocalState(
         state
@@ -237,6 +238,8 @@ export class MultiProvider {
               ...state,
               transportPeerId: child.provider.peerId,
               transport: child.name,
+              multiproviderSession: this.doc.clientID,
+              multiproviderClock: logicalClock,
             }
           : null,
       );
@@ -304,8 +307,8 @@ export class MultiProvider {
       string,
       {
         state: Record<string, unknown>;
-        clientId: number;
-        clock: number;
+        logicalSession: number | undefined;
+        logicalClock: number | undefined;
         lastUpdated: number;
         provider: string;
       }
@@ -325,16 +328,26 @@ export class MultiProvider {
         const meta = child.awareness.meta.get(clientId);
         const candidate = {
           state: { ...state, peerId },
-          clientId,
-          clock: meta?.clock ?? 0,
+          logicalSession:
+            typeof state["multiproviderSession"] === "number"
+              ? state["multiproviderSession"]
+              : undefined,
+          logicalClock:
+            typeof state["multiproviderClock"] === "number"
+              ? state["multiproviderClock"]
+              : undefined,
           lastUpdated: meta?.lastUpdated ?? 0,
           provider: child.name,
         };
         const current = selected.get(peerId);
         const candidateIsNewer =
-          current !== undefined && candidate.clientId === current.clientId
-            ? candidate.clock > current.clock ||
-              (candidate.clock === current.clock &&
+          current !== undefined &&
+          candidate.logicalSession !== undefined &&
+          current.logicalSession === candidate.logicalSession &&
+          candidate.logicalClock !== undefined &&
+          current.logicalClock !== undefined
+            ? candidate.logicalClock > current.logicalClock ||
+              (candidate.logicalClock === current.logicalClock &&
                 (candidate.lastUpdated > current.lastUpdated ||
                   (candidate.lastUpdated === current.lastUpdated &&
                     candidate.provider === preferredProvider &&
@@ -441,7 +454,7 @@ export class MultiAwareness extends Awareness {
         previousState !== null && state !== null && !equalityDeep(previousState, state)
           ? [this.clientID]
           : [],
-      removed: previousState !== null && state === null ? [this.clientID] : [],
+      removed: state === null ? [this.clientID] : [],
     };
     const updates: AwarenessChanges = {
       added: changes.added,
@@ -469,7 +482,7 @@ export class MultiAwareness extends Awareness {
       if (previousState === undefined) {
         added.push(clientId);
         if (!this.meta.has(clientId)) {
-          this.meta.set(clientId, { clock: 0, lastUpdated: currentAwarenessTime() });
+          this.meta.set(clientId, { clock: 1, lastUpdated: currentAwarenessTime() });
         }
       } else {
         const changed = !equalityDeep(previousState, state);
@@ -498,6 +511,7 @@ export class MultiAwareness extends Awareness {
 
   destroy(): void {
     if (this.destroyed) return;
+    this.setLocalState(null);
     this.destroyed = true;
     this.states.clear();
     this.meta.clear();
@@ -507,7 +521,7 @@ export class MultiAwareness extends Awareness {
   private updateMeta(clientId: number): void {
     const previous = this.meta.get(clientId);
     this.meta.set(clientId, {
-      clock: previous === undefined ? 0 : previous.clock + 1,
+      clock: previous === undefined ? 1 : previous.clock + 1,
       lastUpdated: currentAwarenessTime(),
     });
   }

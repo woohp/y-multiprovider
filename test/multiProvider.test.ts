@@ -185,12 +185,29 @@ describe("MultiProvider", () => {
       peerId: "player-a",
       transport: "first",
       transportPeerId: "first-local",
+      multiproviderSession: doc.clientID,
+      multiproviderClock: 1,
     });
     expect(instances[1]!.awareness.getLocalState()).toEqual({
       peerId: "player-a",
       transport: "second",
       transportPeerId: "second-local",
+      multiproviderSession: doc.clientID,
+      multiproviderClock: 1,
     });
+
+    const roundTripDoc = new Y.Doc();
+    const roundTripAwareness = new Awareness(roundTripDoc);
+    applyAwarenessUpdate(
+      roundTripAwareness,
+      encodeAwarenessUpdate(provider.awareness, [doc.clientID]),
+      "test",
+    );
+    expect(roundTripAwareness.getStates().get(doc.clientID)).toEqual({
+      peerId: "player-a",
+    });
+    roundTripAwareness.destroy();
+    roundTripDoc.destroy();
 
     provider.destroy();
     doc.destroy();
@@ -439,12 +456,16 @@ describe("MultiProvider", () => {
       transportPeerId: "first-remote",
       transport: "first",
       cursor: "old",
+      multiproviderSession: remoteClientId,
+      multiproviderClock: 1,
     });
     publish(instances[1]!.awareness, {
       peerId: "player-c",
       transportPeerId: "second-remote",
       transport: "second",
       cursor: "old",
+      multiproviderSession: remoteClientId,
+      multiproviderClock: 1,
     });
 
     remoteAwareness.setLocalState({ peerId: "player-c", cursor: "new" });
@@ -453,6 +474,8 @@ describe("MultiProvider", () => {
       transportPeerId: "second-remote",
       transport: "second",
       cursor: "new",
+      multiproviderSession: remoteClientId,
+      multiproviderClock: 2,
     });
 
     const state = [...provider.awareness.getStates()].find(
@@ -470,6 +493,8 @@ describe("MultiProvider", () => {
       transportPeerId: "second-remote",
       transport: "second",
       cursor: "new",
+      multiproviderSession: remoteClientId,
+      multiproviderClock: 2,
     });
     expect(updates).toHaveBeenLastCalledWith(
       { added: [], updated: [state![0]], removed: [] },
