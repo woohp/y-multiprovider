@@ -105,7 +105,9 @@ export class MultiProvider {
     if (names.size !== options.providers.length) {
       throw new Error("MultiProvider provider names must be unique");
     }
-    this.awareness = new MultiAwareness(doc, (state) => this.publishLocalAwareness(state));
+    this.awareness = new MultiAwareness(doc, (state, changed) =>
+      this.publishLocalAwareness(state, changed),
+    );
     this.children = options.providers.map((definition) => {
       const awareness = new Awareness(doc);
       const provider = definition.create({ doc, awareness });
@@ -229,8 +231,9 @@ export class MultiProvider {
     return null;
   }
 
-  private publishLocalAwareness(state: Record<string, unknown> | null): void {
-    const logicalClock = state ? ++this.logicalAwarenessClock : this.logicalAwarenessClock;
+  private publishLocalAwareness(state: Record<string, unknown> | null, changed: boolean): void {
+    const logicalClock =
+      state && changed ? ++this.logicalAwarenessClock : this.logicalAwarenessClock;
     for (const child of this.children ?? []) {
       child.awareness.setLocalState(
         state
@@ -313,6 +316,14 @@ export class MultiProvider {
         provider: string;
       }
     >();
+    const previousSelectedProviders = new Map<string, string>();
+    for (const state of this.awareness.getStates().values()) {
+      const peerId = this.getLogicalPeerId(state);
+      const provider = state["transport"];
+      if (peerId && typeof provider === "string") {
+        previousSelectedProviders.set(peerId, provider);
+      }
+    }
 
     for (const child of this.children) {
       for (const [clientId, rawState] of child.awareness.getStates()) {
@@ -340,6 +351,7 @@ export class MultiProvider {
           provider: child.name,
         };
         const current = selected.get(peerId);
+        const previousProvider = previousSelectedProviders.get(peerId);
         const candidateIsNewer =
           current !== undefined &&
           candidate.logicalSession !== undefined &&
@@ -348,15 +360,16 @@ export class MultiProvider {
           current.logicalClock !== undefined
             ? candidate.logicalClock > current.logicalClock ||
               (candidate.logicalClock === current.logicalClock &&
-                (candidate.lastUpdated > current.lastUpdated ||
-                  (candidate.lastUpdated === current.lastUpdated &&
-                    candidate.provider === preferredProvider &&
-                    current.provider !== preferredProvider)))
+                candidate.provider === previousProvider &&
+                current.provider !== previousProvider)
             : current !== undefined &&
               (candidate.lastUpdated > current.lastUpdated ||
                 (candidate.lastUpdated === current.lastUpdated &&
-                  candidate.provider === preferredProvider &&
-                  current.provider !== preferredProvider));
+                  ((candidate.provider === previousProvider &&
+                    current.provider !== previousProvider) ||
+                    (previousProvider === undefined &&
+                      candidate.provider === preferredProvider &&
+                      current.provider !== preferredProvider))));
         if (current === undefined || candidateIsNewer) {
           selected.set(peerId, candidate);
         }
@@ -420,10 +433,15 @@ export class MultiProvider {
 }
 
 export class MultiAwareness extends Awareness {
-  private publishLocalState: ((state: Record<string, unknown> | null) => void) | undefined;
+  private publishLocalState:
+    | ((state: Record<string, unknown> | null, changed: boolean) => void)
+    | undefined;
   private destroyed = false;
 
-  constructor(doc: Y.Doc, publishLocalState: (state: Record<string, unknown> | null) => void) {
+  constructor(
+    doc: Y.Doc,
+    publishLocalState: (state: Record<string, unknown> | null, changed: boolean) => void,
+  ) {
     super(doc);
     this.publishLocalState = publishLocalState;
     super.setLocalState(null);
@@ -443,10 +461,14 @@ export class MultiAwareness extends Awareness {
     if (this.destroyed) return;
 
     const previousState = this.getLocalState();
+    const stateChanged =
+      state === null
+        ? previousState !== null
+        : previousState === null || !equalityDeep(previousState, state);
     if (state === null) this.states.delete(this.clientID);
     else this.states.set(this.clientID, state);
     this.updateMeta(this.clientID);
-    this.publishLocalState(state);
+    this.publishLocalState(state, stateChanged);
 
     const changes: AwarenessChanges = {
       added: previousState === null && state !== null ? [this.clientID] : [],

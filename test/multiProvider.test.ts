@@ -436,7 +436,9 @@ describe("MultiProvider", () => {
     const remoteAwareness = new Awareness(remoteDoc);
     const remoteClientId = remoteDoc.clientID;
     const updates = vi.fn();
+    const changes = vi.fn();
     provider.awareness.on("update", updates);
+    provider.awareness.on("change", changes);
 
     const publish = (target: Awareness, state: Record<string, unknown>): void => {
       applyAwarenessUpdate(
@@ -486,6 +488,17 @@ describe("MultiProvider", () => {
       { added: [], updated: [state![0]], removed: [] },
       "test",
     );
+    const changeCount = changes.mock.calls.length;
+    publish(instances[0]!.awareness, {
+      peerId: "player-c",
+      transportPeerId: "first-remote",
+      transport: "first",
+      cursor: "new",
+      multiproviderSession: remoteClientId,
+      multiproviderClock: 2,
+    });
+    expect(changes).toHaveBeenCalledTimes(changeCount);
+    expect(state?.[1]).toMatchObject({ cursor: "new", transport: "second" });
 
     remoteAwareness.setLocalState({ peerId: "player-c", cursor: "new" });
     publish(instances[1]!.awareness, {
