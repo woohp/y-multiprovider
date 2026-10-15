@@ -41,7 +41,10 @@ Child providers provide:
 - A standard `y-protocols/awareness` instance supplied through the provider context.
 
 The child `peerId` is a transport identity. Applications advertise their stable
-logical identity as `peerId` in the awareness state. The multiprovider adds
+logical identity as `peerId` in the awareness state. A `peerId` must belong to one live
+session at a time, such as a device or player, not a user with several tabs open: two
+sessions sharing it would alternate in presence and receive directed messages through only
+one of them. The multiprovider adds
 `transportPeerId` and a `multiproviderClock` revision to each child awareness state, and
 strips them again from the merged state, so switching routes is invisible to consumers.
 
