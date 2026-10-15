@@ -1,4 +1,5 @@
 import { equalityDeep } from "lib0/function";
+import { ObservableV2 } from "lib0/observable";
 import type * as Y from "yjs";
 import { Awareness } from "y-protocols/awareness";
 
@@ -55,9 +56,6 @@ export interface LogicalPeerChange {
   transports: readonly string[];
 }
 
-type MultiProviderEventName = keyof MultiProviderEvents & string;
-type Listener = (...args: unknown[]) => void;
-
 export interface AwarenessChanges {
   added: number[];
   updated: number[];
@@ -71,7 +69,13 @@ interface Child {
   provider: ChildProvider;
   awareness: Awareness;
   handleAwarenessUpdate: ChildAwarenessListener;
-  remotePeerIds: Map<number, string>;
+}
+
+interface Candidate {
+  clientId: number;
+  clock: number;
+  lastUpdated: number;
+  state: Record<string, unknown>;
 }
 
 const FRAME_MAGIC = new Uint8Array([0x79, 0x6d, 0x70, 0x31]);
@@ -79,25 +83,22 @@ const MESSAGE_ID_LENGTH = 16;
 const FRAME_HEADER_LENGTH = FRAME_MAGIC.length + MESSAGE_ID_LENGTH;
 const SEEN_MESSAGE_LIMIT = 1000;
 
-export class MultiProvider {
-  readonly awareness: MultiAwareness;
+export class MultiProvider extends ObservableV2<MultiProviderEvents> {
+  readonly awareness: Awareness;
   readonly ready: Promise<void>;
   private readonly children: Child[];
-  private readonly listeners = new Map<string, Set<Listener>>();
-  private readonly routes = new Map<string, Map<string, string>>();
+  private routes = new Map<string, Map<string, string>>();
   private readonly stateIds = new Map<string, number>();
-  private readonly allocatedStateIds = new Set<number>();
-  private logicalAwarenessClock = 0;
   private nextStateId = 1;
+  private localClock = 0;
   private readonly seenMessageIds = new Set<string>();
-  private readonly seenMessageQueue: string[] = [];
   private destroyed = false;
 
   constructor(
-    readonly roomName: string,
     readonly doc: Y.Doc,
     options: MultiProviderOptions,
   ) {
+    super();
     if (options.providers.length === 0) {
       throw new Error("MultiProvider requires at least one provider");
     }
@@ -105,35 +106,30 @@ export class MultiProvider {
     if (names.size !== options.providers.length) {
       throw new Error("MultiProvider provider names must be unique");
     }
-    this.awareness = new MultiAwareness(doc, (state, changed) =>
-      this.publishLocalAwareness(state, changed),
-    );
+    this.awareness = new Awareness(doc);
+    this.awareness.setLocalState(null);
     this.children = options.providers.map((definition) => {
       const awareness = new Awareness(doc);
-      const provider = definition.create({ doc, awareness });
       const child: Child = {
         name: definition.name,
-        provider,
+        provider: definition.create({ doc, awareness }),
         awareness,
         handleAwarenessUpdate: (changes, origin) =>
           this.handleAwarenessUpdate(child, changes, origin),
-        remotePeerIds: new Map(),
       };
-      this.syncChildPeerIds(child);
       awareness.on("update", child.handleAwarenessUpdate);
       this.attachProvider(child);
       return child;
     });
-    this.rebuildAwareness(new Set());
+    this.awareness.on("update", ({ added, updated, removed }: AwarenessChanges) => {
+      if ([...added, ...updated, ...removed].includes(this.doc.clientID)) {
+        this.publishLocalAwareness();
+      }
+    });
+    this.rebuildAwareness(new Set(), "remote");
     this.ready = Promise.any(this.children.map(({ provider }) => provider.ready)).then(
       () => undefined,
     );
-  }
-
-  on<Name extends MultiProviderEventName>(event: Name, listener: MultiProviderEvents[Name]): void {
-    const listeners = this.listeners.get(event) ?? new Set<Listener>();
-    listeners.add(listener as unknown as Listener);
-    this.listeners.set(event, listeners);
   }
 
   async connect(): Promise<void> {
@@ -157,7 +153,7 @@ export class MultiProvider {
     return sent;
   }
 
-  destroy(): void {
+  override destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
     this.awareness.destroy();
@@ -166,30 +162,27 @@ export class MultiProvider {
       child.provider.destroy();
       child.awareness.destroy();
     }
-    this.listeners.clear();
-    this.routes.clear();
-    this.stateIds.clear();
-    this.allocatedStateIds.clear();
+    super.destroy();
   }
 
   private attachProvider(child: Child): void {
     this.onChildProviderEvent(child, "status", (event) => {
-      this.emit("status", { provider: child.name, event });
+      this.emit("status", [{ provider: child.name, event }]);
     });
     this.onChildProviderEvent(child, "synced", (synced) => {
-      this.emit("synced", { provider: child.name, synced });
+      this.emit("synced", [{ provider: child.name, synced }]);
     });
     this.onChildProviderEvent(child, "peers", (peerIds) => {
-      this.emit("peers", { provider: child.name, peerIds });
+      this.emit("peers", [{ provider: child.name, peerIds }]);
     });
     this.onChildProviderEvent(child, "debug", (event) => {
-      this.emit("debug", { provider: child.name, event });
+      this.emit("debug", [{ provider: child.name, event }]);
     });
     this.onChildProviderEvent(child, "connection-error", (event) => {
-      this.emit("connection-error", { provider: child.name, event });
+      this.emit("connection-error", [{ provider: child.name, event }]);
     });
     this.onChildProviderEvent(child, "peer-error", (event) => {
-      this.emit("peer-error", { provider: child.name, event });
+      this.emit("peer-error", [{ provider: child.name, event }]);
     });
     this.onChildProviderEvent(child, "direct-message", (transportPeerId, frame) => {
       this.handleDirectMessage(child.name, transportPeerId, frame);
@@ -214,14 +207,14 @@ export class MultiProvider {
     this.rememberMessage(decoded.id);
 
     const peerId = this.findLogicalPeerId(providerName, transportPeerId);
-    if (peerId) this.emit("direct-message", peerId, decoded.payload);
+    if (peerId) this.emit("direct-message", [peerId, decoded.payload]);
   }
 
   private rememberMessage(id: string): void {
     this.seenMessageIds.add(id);
-    this.seenMessageQueue.push(id);
-    if (this.seenMessageQueue.length <= SEEN_MESSAGE_LIMIT) return;
-    this.seenMessageIds.delete(this.seenMessageQueue.shift()!);
+    if (this.seenMessageIds.size > SEEN_MESSAGE_LIMIT) {
+      this.seenMessageIds.delete(this.seenMessageIds.values().next().value!);
+    }
   }
 
   private findLogicalPeerId(providerName: string, transportPeerId: string): string | null {
@@ -231,168 +224,72 @@ export class MultiProvider {
     return null;
   }
 
-  private publishLocalAwareness(state: Record<string, unknown> | null, changed: boolean): void {
-    const logicalClock =
-      state && changed ? ++this.logicalAwarenessClock : this.logicalAwarenessClock;
-    for (const child of this.children ?? []) {
+  private publishLocalAwareness(): void {
+    const state = this.awareness.getLocalState();
+    const clock = ++this.localClock;
+    for (const child of this.children) {
       child.awareness.setLocalState(
-        state
-          ? {
-              ...state,
-              transportPeerId: child.provider.peerId,
-              transport: child.name,
-              multiproviderSession: this.doc.clientID,
-              multiproviderClock: logicalClock,
-            }
-          : null,
+        state && { ...state, transportPeerId: child.provider.peerId, multiproviderClock: clock },
       );
     }
   }
 
-  private syncChildPeerIds(child: Child): void {
-    child.remotePeerIds.clear();
-    for (const [clientId, state] of child.awareness.getStates()) {
-      if (clientId === this.doc.clientID) continue;
-      const peerId = this.getLogicalPeerId(state);
-      if (peerId) child.remotePeerIds.set(clientId, peerId);
-    }
-  }
-
-  private handleAwarenessUpdate(child: Child, changes: AwarenessChanges, origin: unknown): void {
-    const affectedPeerIds = new Set<string>();
-    let hasRemoteChange = false;
-    const updatedClientIds = new Set([...changes.added, ...changes.updated]);
-
-    for (const clientId of updatedClientIds) {
-      if (clientId === this.doc.clientID) continue;
-      hasRemoteChange = true;
-      const previousPeerId = child.remotePeerIds.get(clientId);
-      if (previousPeerId) affectedPeerIds.add(previousPeerId);
-
-      const state = child.awareness.getStates().get(clientId);
-      const peerId = state ? this.getLogicalPeerId(state) : null;
-      if (peerId) {
-        child.remotePeerIds.set(clientId, peerId);
-        affectedPeerIds.add(peerId);
-      } else {
-        child.remotePeerIds.delete(clientId);
-      }
-    }
-
-    for (const clientId of changes.removed) {
-      if (clientId === this.doc.clientID) continue;
-      hasRemoteChange = true;
-      const peerId = child.remotePeerIds.get(clientId);
-      if (peerId) affectedPeerIds.add(peerId);
-      child.remotePeerIds.delete(clientId);
-    }
-
-    if (hasRemoteChange) {
-      this.rebuildAwareness(affectedPeerIds, child.name, origin);
-    }
-  }
-
-  private getLogicalPeerId(state: Record<string, unknown>): string | null {
-    const peerId = state["peerId"];
-    const transportPeerId = state["transportPeerId"];
-    return typeof peerId === "string" && typeof transportPeerId === "string" ? peerId : null;
-  }
-
-  private rebuildAwareness(
-    affectedPeerIds: ReadonlySet<string>,
-    preferredProvider: string | undefined = undefined,
-    origin: unknown = "remote",
+  private handleAwarenessUpdate(
+    child: Child,
+    { added, updated, removed }: AwarenessChanges,
+    origin: unknown,
   ): void {
-    const previousRoutes = cloneRoutes(this.routes);
-    const states = new Map<number, Record<string, unknown>>();
-    const routes = new Map<string, Map<string, string>>();
-    const selected = new Map<
-      string,
-      {
-        state: Record<string, unknown>;
-        logicalSession: number | undefined;
-        logicalClock: number | undefined;
-        lastUpdated: number;
-        provider: string;
-      }
-    >();
-    const previousSelectedProviders = new Map<string, string>();
-    for (const state of this.awareness.getStates().values()) {
-      const peerId = this.getLogicalPeerId(state);
-      const provider = state["transport"];
-      if (peerId && typeof provider === "string") {
-        previousSelectedProviders.set(peerId, provider);
-      }
+    const clientIds = [...added, ...updated, ...removed].filter(
+      (clientId) => clientId !== this.doc.clientID,
+    );
+    if (clientIds.length === 0) return;
+
+    const states = child.awareness.getStates();
+    const updatedPeerIds = new Set<string>();
+    for (const clientId of clientIds) {
+      const state = states.get(clientId);
+      const peerId = state && getLogicalPeerId(state);
+      if (peerId) updatedPeerIds.add(peerId);
     }
+    this.rebuildAwareness(updatedPeerIds, origin);
+  }
+
+  private rebuildAwareness(updatedPeerIds: ReadonlySet<string>, origin: unknown): void {
+    const routes = new Map<string, Map<string, string>>();
+    const selected = new Map<string, Candidate>();
 
     for (const child of this.children) {
       for (const [clientId, rawState] of child.awareness.getStates()) {
         if (clientId === this.doc.clientID) continue;
-        const state = rawState as Record<string, unknown>;
-        const peerId = this.getLogicalPeerId(state);
+        const peerId = getLogicalPeerId(rawState);
         if (!peerId) continue;
+        const { transportPeerId, multiproviderClock, ...state } = rawState;
 
         const peerRoutes = routes.get(peerId) ?? new Map<string, string>();
-        peerRoutes.set(child.name, state["transportPeerId"] as string);
+        peerRoutes.set(child.name, transportPeerId);
         routes.set(peerId, peerRoutes);
 
-        const meta = child.awareness.meta.get(clientId);
         const candidate = {
-          state: { ...state, peerId },
-          logicalSession:
-            typeof state["multiproviderSession"] === "number"
-              ? state["multiproviderSession"]
-              : undefined,
-          logicalClock:
-            typeof state["multiproviderClock"] === "number"
-              ? state["multiproviderClock"]
-              : undefined,
-          lastUpdated: meta?.lastUpdated ?? 0,
-          provider: child.name,
+          clientId,
+          clock: multiproviderClock,
+          lastUpdated: child.awareness.meta.get(clientId)!.lastUpdated,
+          state,
         };
         const current = selected.get(peerId);
-        const previousProvider = previousSelectedProviders.get(peerId);
-        const candidateIsNewer =
-          current !== undefined &&
-          candidate.logicalSession !== undefined &&
-          current.logicalSession === candidate.logicalSession &&
-          candidate.logicalClock !== undefined &&
-          current.logicalClock !== undefined
-            ? candidate.logicalClock > current.logicalClock ||
-              (candidate.logicalClock === current.logicalClock &&
-                candidate.provider === previousProvider &&
-                current.provider !== previousProvider)
-            : current !== undefined &&
-              (candidate.lastUpdated > current.lastUpdated ||
-                (candidate.lastUpdated === current.lastUpdated &&
-                  ((candidate.provider === previousProvider &&
-                    current.provider !== previousProvider) ||
-                    (previousProvider === undefined &&
-                      candidate.provider === preferredProvider &&
-                      current.provider !== preferredProvider))));
-        if (current === undefined || candidateIsNewer) {
-          selected.set(peerId, candidate);
-        }
+        if (!current || isNewer(candidate, current)) selected.set(peerId, candidate);
       }
     }
 
-    this.routes.clear();
-    for (const [peerId, peerRoutes] of routes) this.routes.set(peerId, peerRoutes);
-    this.retireStateIds(new Set(routes.keys()));
-    for (const [peerId, candidate] of selected) {
-      states.set(this.getStateId(peerId), candidate.state);
+    const previousRoutes = this.routes;
+    this.routes = routes;
+    for (const peerId of this.stateIds.keys()) {
+      if (!routes.has(peerId)) this.stateIds.delete(peerId);
     }
-    this.awareness.replaceRemoteStates(states, affectedPeerIds, origin);
+    const states = new Map(
+      [...selected].map(([peerId, { state }]) => [this.getStateId(peerId), state] as const),
+    );
+    replaceRemoteStates(this.awareness, states, updatedPeerIds, origin);
     this.emitPeerChanges(previousRoutes, routes);
-  }
-
-  private retireStateIds(activePeerIds: ReadonlySet<string>): void {
-    for (const [peerId, stateId] of this.stateIds) {
-      if (!activePeerIds.has(peerId)) {
-        this.stateIds.delete(peerId);
-        this.allocatedStateIds.delete(stateId);
-      }
-    }
   }
 
   private getStateId(peerId: string): number {
@@ -400,10 +297,9 @@ export class MultiProvider {
     if (existing !== undefined) return existing;
 
     let stateId = this.nextStateId;
-    while (stateId === this.doc.clientID || this.allocatedStateIds.has(stateId)) stateId++;
+    if (stateId === this.doc.clientID) stateId++;
     this.nextStateId = stateId + 1;
     this.stateIds.set(peerId, stateId);
-    this.allocatedStateIds.add(stateId);
     return stateId;
   }
 
@@ -416,156 +312,61 @@ export class MultiProvider {
       const previous = previousRoutes.get(peerId);
       const next = nextRoutes.get(peerId);
       if ((previous !== undefined) === (next !== undefined)) continue;
-      this.emit("peer-change", {
-        peerId,
-        connected: next !== undefined,
-        transports: next ? [...next.keys()] : [],
-      });
+      this.emit("peer-change", [
+        { peerId, connected: next !== undefined, transports: next ? [...next.keys()] : [] },
+      ]);
     }
-  }
-
-  private emit<Name extends MultiProviderEventName>(
-    event: Name,
-    ...args: Parameters<MultiProviderEvents[Name]>
-  ): void {
-    for (const listener of this.listeners.get(event) ?? []) listener(...args);
   }
 }
 
-export class MultiAwareness extends Awareness {
-  private publishLocalState:
-    | ((state: Record<string, unknown> | null, changed: boolean) => void)
-    | undefined;
-  private destroyed = false;
-
-  constructor(
-    doc: Y.Doc,
-    publishLocalState: (state: Record<string, unknown> | null, changed: boolean) => void,
-  ) {
-    super(doc);
-    this.publishLocalState = publishLocalState;
-    super.setLocalState(null);
-    this.states.clear();
-    this.meta.clear();
-  }
-
-  getLocalState(): Record<string, unknown> | null {
-    return (this.states.get(this.clientID) as Record<string, unknown> | undefined) ?? null;
-  }
-
-  setLocalState(state: Record<string, unknown> | null): void {
-    if (this.publishLocalState === undefined) {
-      super.setLocalState(state);
-      return;
-    }
-    if (this.destroyed) return;
-
-    const previousState = this.getLocalState();
-    const stateChanged =
-      state === null
-        ? previousState !== null
-        : previousState === null || !equalityDeep(previousState, state);
-    if (state === null) this.states.delete(this.clientID);
-    else this.states.set(this.clientID, state);
-    this.updateMeta(this.clientID);
-    this.publishLocalState(state, stateChanged);
-
-    const changes: AwarenessChanges = {
-      added: previousState === null && state !== null ? [this.clientID] : [],
-      updated:
-        previousState !== null && state !== null && !equalityDeep(previousState, state)
-          ? [this.clientID]
-          : [],
-      removed: state === null ? [this.clientID] : [],
-    };
-    const updates: AwarenessChanges = {
-      added: changes.added,
-      updated: previousState !== null && state !== null ? [this.clientID] : [],
-      removed: changes.removed,
-    };
-    this.emitAwarenessChanges(changes, updates, "local");
-  }
-
-  replaceRemoteStates(
-    states: Map<number, Record<string, unknown>>,
-    updatedPeerIds: ReadonlySet<string> = new Set(),
-    origin: unknown = "remote",
-  ): void {
-    const previousLocalState = this.getLocalState();
-    const previousRemoteStates = new Map(this.states);
-    previousRemoteStates.delete(this.clientID);
-    const added: number[] = [];
-    const updated: number[] = [];
-    const updateIds: number[] = [];
-    const removed: number[] = [];
-
-    for (const [clientId, state] of states) {
-      const previousState = previousRemoteStates.get(clientId);
-      if (previousState === undefined) {
-        added.push(clientId);
-        if (!this.meta.has(clientId)) {
-          this.meta.set(clientId, { clock: 1, lastUpdated: currentAwarenessTime() });
-        }
-      } else {
-        const changed = !equalityDeep(previousState, state);
-        const peerId = state["peerId"];
-        if (changed) updated.push(clientId);
-        if (changed || (typeof peerId === "string" && updatedPeerIds.has(peerId))) {
-          updateIds.push(clientId);
-          this.updateMeta(clientId);
-        }
-      }
-    }
-    for (const clientId of previousRemoteStates.keys()) {
-      if (!states.has(clientId)) removed.push(clientId);
-    }
-
-    this.states.clear();
-    for (const [clientId, state] of states) this.states.set(clientId, state);
-    if (previousLocalState !== null) this.states.set(this.clientID, previousLocalState);
-
-    this.emitAwarenessChanges(
-      { added, updated, removed },
-      { added, updated: updateIds, removed },
-      origin,
-    );
-  }
-
-  destroy(): void {
-    if (this.destroyed) return;
-    this.setLocalState(null);
-    this.destroyed = true;
-    this.states.clear();
-    this.meta.clear();
-    super.destroy();
-  }
-
-  private updateMeta(clientId: number): void {
-    const previous = this.meta.get(clientId);
-    this.meta.set(clientId, {
-      clock: previous === undefined ? 1 : previous.clock + 1,
-      lastUpdated: currentAwarenessTime(),
-    });
-  }
-
-  private emitAwarenessChanges(
-    changes: AwarenessChanges,
-    updates: AwarenessChanges,
-    origin: unknown,
-  ): void {
-    if (changes.added.length || changes.updated.length || changes.removed.length) {
-      this.emit("change", [changes, origin]);
-    }
-    this.emit("update", [updates, origin]);
-  }
+function getLogicalPeerId(state: Record<string, unknown>): string | null {
+  return typeof state["peerId"] === "string" &&
+    typeof state["transportPeerId"] === "string" &&
+    typeof state["multiproviderClock"] === "number"
+    ? state["peerId"]
+    : null;
 }
 
-function currentAwarenessTime(): number {
-  return Date.now();
+// The same remote session has the same client ID on every transport, so its clocks are comparable.
+function isNewer(candidate: Candidate, current: Candidate): boolean {
+  return candidate.clientId === current.clientId
+    ? candidate.clock > current.clock
+    : candidate.lastUpdated > current.lastUpdated;
 }
 
-function cloneRoutes(routes: Map<string, Map<string, string>>): Map<string, Map<string, string>> {
-  return new Map([...routes].map(([peerId, peerRoutes]) => [peerId, new Map(peerRoutes)] as const));
+function replaceRemoteStates(
+  awareness: Awareness,
+  states: Map<number, Record<string, unknown>>,
+  updatedPeerIds: ReadonlySet<string>,
+  origin: unknown,
+): void {
+  const added: number[] = [];
+  const updated: number[] = [];
+  const renewed: number[] = [];
+  const removed: number[] = [];
+
+  for (const [clientId, state] of states) {
+    const previous = awareness.states.get(clientId);
+    if (previous === undefined) added.push(clientId);
+    else if (!equalityDeep(previous, state)) updated.push(clientId);
+    else if (updatedPeerIds.has(state["peerId"] as string)) renewed.push(clientId);
+    else continue;
+    const clock = awareness.meta.get(clientId)?.clock ?? 0;
+    awareness.meta.set(clientId, { clock: clock + 1, lastUpdated: Date.now() });
+  }
+  for (const clientId of awareness.states.keys()) {
+    if (clientId !== awareness.clientID && !states.has(clientId)) removed.push(clientId);
+  }
+
+  for (const clientId of removed) awareness.states.delete(clientId);
+  for (const [clientId, state] of states) awareness.states.set(clientId, state);
+
+  if (added.length || updated.length || removed.length) {
+    awareness.emit("change", [{ added, updated, removed }, origin]);
+  }
+  if (added.length || updated.length || renewed.length || removed.length) {
+    awareness.emit("update", [{ added, updated: [...updated, ...renewed], removed }, origin]);
+  }
 }
 
 function createFrame(payload: Uint8Array): Uint8Array {

@@ -11,7 +11,7 @@ import * as Y from "yjs";
 import { MultiProvider } from "y-multiprovider";
 
 const doc = new Y.Doc();
-const provider = new MultiProvider("room", doc, {
+const provider = new MultiProvider(doc, {
   providers: [
     {
       name: "first",
@@ -42,15 +42,15 @@ Child providers provide:
 
 The child `peerId` is a transport identity. Applications advertise their stable
 logical identity as `peerId` in the awareness state. The multiprovider adds
-`transport` and `transportPeerId` to each child awareness state.
+`transportPeerId` and a `multiproviderClock` revision to each child awareness state, and
+strips them again from the merged state, so switching routes is invisible to consumers.
 
 The wrapper forwards child lifecycle events with a `provider` name. `peers` remains
 transport-specific; `peer-change` reports the merged logical peer lifecycle and
 lists all currently available transport routes.
 
-`MultiAwareness` exposes the consumer-facing awareness surface used by Yjs bindings:
-`getStates()`, `getLocalState()`, `setLocalState()`, `setLocalStateField()`, and
-`change`/`update` events with `{ added, updated, removed }` changes.
+`provider.awareness` is a standard `y-protocols/awareness` instance holding the local
+state and one merged state per logical remote peer, so it works with Yjs bindings.
 
 ```sh
 npm install
