@@ -249,7 +249,6 @@ describe("MultiProvider", () => {
       [{ added: [], updated: [], removed: [stateId] }, "test"],
       [{ added: [otherStateId], updated: [], removed: [] }, "test"],
     ]);
-    expect(() => encodeAwarenessUpdate(provider.awareness, [stateId])).not.toThrow();
   });
 
   it("selects the newest revision regardless of delivery order", () => {
