@@ -32,6 +32,7 @@ Keep this guide to durable, non-obvious decisions. `README.md` covers usage and 
 - `RemotePeer` models a real remote session: one client ID across transports. Separate remote docs model separate sessions, such as a reload; one session with a different client ID per transport cannot occur.
 - Assert outcomes consumers can see: merged states, full `change`/`peer-change` event logs (`mock.calls`), and frames sent. Do not re-test y-protocols behavior of a plain `Awareness`.
 - Fake timers do not affect awareness timestamps: lib0 captures `Date.now` at import. When an outcome depends on `lastUpdated` ordering, wait a couple of real milliseconds between updates.
+- Tests are typechecked: `tsconfig.json` covers `src` and `test`, and `tsconfig.build.json` emits `src` only.
 
 ## Commands
 
