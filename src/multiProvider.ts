@@ -1,7 +1,7 @@
-import { equalityDeep } from "lib0/function";
+import * as encoding from "lib0/encoding";
 import { ObservableV2 } from "lib0/observable";
 import type * as Y from "yjs";
-import { Awareness } from "y-protocols/awareness";
+import { Awareness, applyAwarenessUpdate } from "y-protocols/awareness";
 
 export interface ChildProviderEvents {
   status: (event: unknown) => void;
@@ -62,13 +62,10 @@ export interface AwarenessChanges {
   removed: number[];
 }
 
-type ChildAwarenessListener = (changes: AwarenessChanges, origin: unknown) => void;
-
 interface Child {
   name: string;
   provider: ChildProvider;
   awareness: Awareness;
-  handleAwarenessUpdate: ChildAwarenessListener;
 }
 
 interface Candidate {
@@ -94,6 +91,16 @@ export class MultiProvider extends ObservableV2<MultiProviderEvents> {
   private readonly seenMessageIds = new Set<string>();
   private destroyed = false;
 
+  private readonly handleChildAwarenessUpdate = (
+    { added, updated, removed }: AwarenessChanges,
+    origin: unknown,
+  ): void => {
+    const clientIds = [...added, ...updated, ...removed];
+    if (clientIds.some((clientId) => clientId !== this.awareness.clientID)) {
+      this.rebuildAwareness(origin);
+    }
+  };
+
   constructor(
     readonly doc: Y.Doc,
     options: MultiProviderOptions,
@@ -110,23 +117,22 @@ export class MultiProvider extends ObservableV2<MultiProviderEvents> {
     this.awareness.setLocalState(null);
     this.children = options.providers.map((definition) => {
       const awareness = new Awareness(doc);
-      const child: Child = {
+      const child = {
         name: definition.name,
         provider: definition.create({ doc, awareness }),
         awareness,
-        handleAwarenessUpdate: (changes, origin) =>
-          this.handleAwarenessUpdate(child, changes, origin),
       };
-      awareness.on("update", child.handleAwarenessUpdate);
+      awareness.on("update", this.handleChildAwarenessUpdate);
       this.attachProvider(child);
       return child;
     });
     this.awareness.on("update", ({ added, updated, removed }: AwarenessChanges) => {
-      if ([...added, ...updated, ...removed].includes(this.doc.clientID)) {
+      if ([...added, ...updated, ...removed].includes(this.awareness.clientID)) {
         this.publishLocalAwareness();
       }
     });
-    this.rebuildAwareness(new Set(), "remote");
+    // A factory may populate its awareness synchronously, before the listener above is attached.
+    this.rebuildAwareness("remote");
     this.ready = Promise.any(this.children.map(({ provider }) => provider.ready)).then(
       () => undefined,
     );
@@ -158,10 +164,11 @@ export class MultiProvider extends ObservableV2<MultiProviderEvents> {
     this.destroyed = true;
     this.awareness.destroy();
     for (const child of this.children) {
-      child.awareness.off("update", child.handleAwarenessUpdate);
+      child.awareness.off("update", this.handleChildAwarenessUpdate);
       child.provider.destroy();
       child.awareness.destroy();
     }
+    this.routes.clear();
     super.destroy();
   }
 
@@ -203,11 +210,12 @@ export class MultiProvider extends ObservableV2<MultiProviderEvents> {
     frame: Uint8Array,
   ): void {
     const decoded = decodeFrame(frame);
-    if (!decoded || this.seenMessageIds.has(decoded.id)) return;
-    this.rememberMessage(decoded.id);
-
+    if (!decoded) return;
+    // Resolve the sender first: a copy from a route not yet in awareness must not mark the frame seen.
     const peerId = this.findLogicalPeerId(providerName, transportPeerId);
-    if (peerId) this.emit("direct-message", [peerId, decoded.payload]);
+    if (!peerId || this.seenMessageIds.has(decoded.id)) return;
+    this.rememberMessage(decoded.id);
+    this.emit("direct-message", [peerId, decoded.payload]);
   }
 
   private rememberMessage(id: string): void {
@@ -234,33 +242,13 @@ export class MultiProvider extends ObservableV2<MultiProviderEvents> {
     }
   }
 
-  private handleAwarenessUpdate(
-    child: Child,
-    { added, updated, removed }: AwarenessChanges,
-    origin: unknown,
-  ): void {
-    const clientIds = [...added, ...updated, ...removed].filter(
-      (clientId) => clientId !== this.doc.clientID,
-    );
-    if (clientIds.length === 0) return;
-
-    const states = child.awareness.getStates();
-    const updatedPeerIds = new Set<string>();
-    for (const clientId of clientIds) {
-      const state = states.get(clientId);
-      const peerId = state && getLogicalPeerId(state);
-      if (peerId) updatedPeerIds.add(peerId);
-    }
-    this.rebuildAwareness(updatedPeerIds, origin);
-  }
-
-  private rebuildAwareness(updatedPeerIds: ReadonlySet<string>, origin: unknown): void {
+  private rebuildAwareness(origin: unknown): void {
     const routes = new Map<string, Map<string, string>>();
     const selected = new Map<string, Candidate>();
 
     for (const child of this.children) {
       for (const [clientId, rawState] of child.awareness.getStates()) {
-        if (clientId === this.doc.clientID) continue;
+        if (clientId === this.awareness.clientID) continue;
         const peerId = getLogicalPeerId(rawState);
         if (!peerId) continue;
         const { transportPeerId, multiproviderClock, ...state } = rawState;
@@ -288,7 +276,7 @@ export class MultiProvider extends ObservableV2<MultiProviderEvents> {
     const states = new Map(
       [...selected].map(([peerId, { state }]) => [this.getStateId(peerId), state] as const),
     );
-    replaceRemoteStates(this.awareness, states, updatedPeerIds, origin);
+    replaceRemoteStates(this.awareness, states, origin);
     this.emitPeerChanges(previousRoutes, routes);
   }
 
@@ -297,7 +285,7 @@ export class MultiProvider extends ObservableV2<MultiProviderEvents> {
     if (existing !== undefined) return existing;
 
     let stateId = this.nextStateId;
-    if (stateId === this.doc.clientID) stateId++;
+    if (stateId === this.awareness.clientID) stateId++;
     this.nextStateId = stateId + 1;
     this.stateIds.set(peerId, stateId);
     return stateId;
@@ -334,39 +322,23 @@ function isNewer(candidate: Candidate, current: Candidate): boolean {
     : candidate.lastUpdated > current.lastUpdated;
 }
 
+// Applying every merged state, not only changed ones, also renews their meta so the base
+// Awareness timeout keeps peers whose routes are alive.
 function replaceRemoteStates(
   awareness: Awareness,
   states: Map<number, Record<string, unknown>>,
-  updatedPeerIds: ReadonlySet<string>,
   origin: unknown,
 ): void {
-  const added: number[] = [];
-  const updated: number[] = [];
-  const renewed: number[] = [];
-  const removed: number[] = [];
-
-  for (const [clientId, state] of states) {
-    const previous = awareness.states.get(clientId);
-    if (previous === undefined) added.push(clientId);
-    else if (!equalityDeep(previous, state)) updated.push(clientId);
-    else if (updatedPeerIds.has(state["peerId"] as string)) renewed.push(clientId);
-    else continue;
-    const clock = awareness.meta.get(clientId)?.clock ?? 0;
-    awareness.meta.set(clientId, { clock: clock + 1, lastUpdated: Date.now() });
+  const clientIds = new Set([...states.keys(), ...awareness.states.keys()]);
+  clientIds.delete(awareness.clientID);
+  const encoder = encoding.createEncoder();
+  encoding.writeVarUint(encoder, clientIds.size);
+  for (const clientId of clientIds) {
+    encoding.writeVarUint(encoder, clientId);
+    encoding.writeVarUint(encoder, (awareness.meta.get(clientId)?.clock ?? 0) + 1);
+    encoding.writeVarString(encoder, JSON.stringify(states.get(clientId) ?? null));
   }
-  for (const clientId of awareness.states.keys()) {
-    if (clientId !== awareness.clientID && !states.has(clientId)) removed.push(clientId);
-  }
-
-  for (const clientId of removed) awareness.states.delete(clientId);
-  for (const [clientId, state] of states) awareness.states.set(clientId, state);
-
-  if (added.length || updated.length || removed.length) {
-    awareness.emit("change", [{ added, updated, removed }, origin]);
-  }
-  if (added.length || updated.length || renewed.length || removed.length) {
-    awareness.emit("update", [{ added, updated: [...updated, ...renewed], removed }, origin]);
-  }
+  applyAwarenessUpdate(awareness, encoding.toUint8Array(encoder), origin);
 }
 
 function createFrame(payload: Uint8Array): Uint8Array {

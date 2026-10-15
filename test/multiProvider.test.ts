@@ -127,6 +127,11 @@ function createTwoProviderSetup(
   return { provider, first: instances[0]!, second: instances[1]! };
 }
 
+function waitForClockTick(): Promise<void> {
+  // lib0 captures Date.now at import, so fake timers cannot advance awareness timestamps.
+  return new Promise((resolve) => setTimeout(resolve, 2));
+}
+
 function peerState(
   provider: MultiProvider,
   peerId: string,
@@ -173,13 +178,21 @@ describe("MultiProvider", () => {
       connect: () => Promise.reject(new Error("offline")),
     });
 
+    new RemotePeer("player-b").publish(first);
+
     await expect(provider.connect()).resolves.toBeUndefined();
     provider.disconnect();
     provider.destroy();
     provider.destroy();
 
+    expect(provider.sendToPeer("player-b", new Uint8Array([1]))).toBe(false);
     for (const instance of [first, second]) {
-      expect(instance).toMatchObject({ connectCalls: 1, disconnectCalls: 1, destroyCalls: 1 });
+      expect(instance).toMatchObject({
+        connectCalls: 1,
+        disconnectCalls: 1,
+        destroyCalls: 1,
+        sent: [],
+      });
     }
   });
 
@@ -188,15 +201,15 @@ describe("MultiProvider", () => {
 
     provider.awareness.setLocalState({ peerId: "player-a" });
 
-    expect(first.awareness.getLocalState()).toEqual({
+    const firstState = first.awareness.getLocalState();
+    expect(firstState).toEqual({
       peerId: "player-a",
       transportPeerId: "first-local",
-      multiproviderClock: 1,
+      multiproviderClock: expect.any(Number),
     });
     expect(second.awareness.getLocalState()).toEqual({
-      peerId: "player-a",
+      ...firstState,
       transportPeerId: "second-local",
-      multiproviderClock: 1,
     });
 
     provider.awareness.setLocalState(null);
@@ -206,6 +219,7 @@ describe("MultiProvider", () => {
 
   it("keeps one stable logical peer until every route disappears", () => {
     const { provider, first, second } = createTwoProviderSetup();
+    provider.awareness.setLocalState({ peerId: "player-a" });
     const awarenessChanges = vi.fn();
     const peerChanges = vi.fn();
     provider.awareness.on("change", awarenessChanges);
@@ -222,13 +236,18 @@ describe("MultiProvider", () => {
 
     remote.leave(second);
     expect(peerState(provider, "player-b")).toBeUndefined();
-    expect(awarenessChanges.mock.calls).toEqual([
-      [{ added: [stateId], updated: [], removed: [] }, "test"],
-      [{ added: [], updated: [], removed: [stateId] }, "test"],
-    ]);
     expect(peerChanges.mock.calls).toEqual([
       [{ peerId: "player-b", connected: true, transports: ["first"] }],
       [{ peerId: "player-b", connected: false, transports: [] }],
+    ]);
+
+    // A later rebuild neither re-removes the departed peer nor touches the local state.
+    new RemotePeer("player-c").publish(first);
+    const [otherStateId] = peerState(provider, "player-c")!;
+    expect(awarenessChanges.mock.calls).toEqual([
+      [{ added: [stateId], updated: [], removed: [] }, "test"],
+      [{ added: [], updated: [], removed: [stateId] }, "test"],
+      [{ added: [otherStateId], updated: [], removed: [] }, "test"],
     ]);
     expect(() => encodeAwarenessUpdate(provider.awareness, [stateId])).not.toThrow();
   });
@@ -267,10 +286,23 @@ describe("MultiProvider", () => {
 
     // The old session lingers on the first transport until it times out.
     new RemotePeer("player-d").publish(first, { session: "old" }, 5);
-    await new Promise((resolve) => setTimeout(resolve, 2));
+    await waitForClockTick();
     new RemotePeer("player-d").publish(second, { session: "new" }, 1);
 
     expect(peerState(provider, "player-d")?.[1]).toEqual({ peerId: "player-d", session: "new" });
+  });
+
+  it("renews merged peers while any route renews", async () => {
+    const { provider, first } = createTwoProviderSetup();
+    const remote = new RemotePeer("player-b");
+    remote.publish(first);
+    const [stateId] = peerState(provider, "player-b")!;
+    const { lastUpdated } = provider.awareness.meta.get(stateId)!;
+
+    await waitForClockTick();
+    remote.publish(first);
+
+    expect(provider.awareness.meta.get(stateId)!.lastUpdated).toBeGreaterThan(lastUpdated);
   });
 
   it("sends through all routes and succeeds when only one transport accepts the message", () => {
@@ -305,7 +337,7 @@ describe("MultiProvider", () => {
     expect(handleMessage.mock.calls).toEqual([["player-b", new Uint8Array([4, 5, 6])]]);
   });
 
-  it("ignores malformed frames and messages from unknown transport peers", () => {
+  it("ignores malformed frames and unknown senders without dropping a known copy", () => {
     const { provider, first } = createTwoProviderSetup();
     new RemotePeer("player-b").publish(first);
     provider.sendToPeer("player-b", new Uint8Array([7]));
@@ -315,8 +347,9 @@ describe("MultiProvider", () => {
 
     first.emit("direct-message", "first-remote", new Uint8Array([1, 2, 3]));
     first.emit("direct-message", "unknown", validFrame);
+    first.emit("direct-message", "first-remote", validFrame);
 
-    expect(handleMessage).not.toHaveBeenCalled();
+    expect(handleMessage.mock.calls).toEqual([["player-b", new Uint8Array([7])]]);
   });
 
   it("forwards child events tagged with the provider name", () => {
