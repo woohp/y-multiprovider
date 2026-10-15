@@ -9,6 +9,7 @@ Keep this guide to durable, non-obvious decisions. `README.md` covers usage and 
 - Each child receives its own `Awareness`. Do not share child Awareness instances: independent presence paths are what keep a peer visible through one transport after another drops it.
 - All children use the same `Y.Doc`, so a remote session has **one awareness client ID on every transport**. That client ID is the session identity; do not add a separate session field.
 - Applications advertise their stable logical identity as `peerId` in the local state. Each child's copy adds `transportPeerId` (its route for directed messages) and `multiproviderClock`. Remote states missing either are not MultiProvider peers and are ignored.
+- A `peerId` identifies one live session (device or player), not a user across tabs. Presence, routes (one transport peer per transport), and `peer-change` all assume it; do not work around concurrent sessions sharing a `peerId` in this library.
 - Yjs document updates need no forwarding: every child observes the same document, and Yjs ignores duplicate updates.
 
 ## Merged awareness
