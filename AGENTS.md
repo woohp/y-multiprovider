@@ -13,7 +13,7 @@ Keep this guide to durable, non-obvious decisions. `README.md` covers usage and 
 
 ## Merged awareness
 
-`provider.awareness` is a plain y-protocols `Awareness`: the local state under its own `clientID` (captured at construction; Yjs may later reassign `doc.clientID`), plus one state per logical remote peer under a stable synthetic ID. Keep it a standard instance that Yjs bindings can use unchanged, not a subclass with a parallel API.
+`provider.awareness` is a plain y-protocols `Awareness`: the local state under its own `clientID` (captured at construction; Yjs may later reassign `doc.clientID`), plus one state per logical remote peer under a synthetic ID that is stable while any route remains. Keep it a standard instance that Yjs bindings can use unchanged, not a subclass with a parallel API.
 
 - **Merged states strip `transportPeerId` and `multiproviderClock`.** Switching which transport supplies a peer's state must be invisible to consumers. Do not expose transport metadata there: it would turn every route switch into a `change` event. Transport details belong in `peer-change` and the per-child events.
 - For a peer reported by several transports, clocks decide only when the reports come from the same client ID; across different client IDs (a reloaded peer whose old session has not timed out yet) the newest `lastUpdated` wins. Clocks from different sessions are unrelated and must not be compared. Selection across overlapping sessions is order-dependent and can briefly show a stale report; this is an accepted limitation until it causes recurring harm.

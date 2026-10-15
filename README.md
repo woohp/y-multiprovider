@@ -51,8 +51,8 @@ and its last route disconnects; `transports` is a snapshot taken at that moment.
 
 `provider.awareness` is a standard `y-protocols/awareness` instance holding the local
 state and one merged state per logical remote peer, so it works with Yjs bindings.
-Merged remote client IDs are synthetic and stable per logical `peerId`; they are not the
-remote document's client IDs.
+Merged remote client IDs are synthetic, not the remote document's client IDs. A peer keeps
+its ID while any transport reaches it; after a full disconnect it returns under a new ID.
 
 ```sh
 npm install
