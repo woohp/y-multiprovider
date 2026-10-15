@@ -1,5 +1,4 @@
 export {
-  MultiAwareness,
   MultiProvider,
   type AwarenessChanges,
   type ChildProvider,
