@@ -32,12 +32,12 @@
     "check": "npm run lint && npm run typecheck && npm test"
   },
   "dependencies": {
-    "lib0": "^0.2.117",
+    "lib0": "^0.2.119",
     "y-protocols": "^1.0.7",
-    "yjs": "^13.6.31"
+    "yjs": "^13.6.33"
   },
   "devDependencies": {
     "typescript": "^7.0.2",
-    "vite-plus": "^0.2.5"
+    "vite-plus": "^1.2.0"
   }
 }
