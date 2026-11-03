@@ -62,3 +62,6 @@ npm install
 npm run check
 npm run build
 ```
+
+GitHub Actions runs formatting checks, lint, typechecking, tests, and the build on
+Ubuntu 26.04 with Node.js 26 LTS for pull requests and pushes to `master`.
